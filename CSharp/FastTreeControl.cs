@@ -1158,7 +1158,14 @@ namespace LvControls
                 ? node.CellForeColors[e.ColumnIndex]
                 : e.CellStyle.ForeColor;
 
-            if (node.Selected) back = ControlPaint.Light(SystemColors.Highlight, 0.4f);
+            // Custom painting bypasses DataGridView's normal selection rendering,
+            // so apply the inherited selection colours explicitly. This preserves
+            // SelectionBackColor/SelectionForeColor set on the control or column.
+            if (node.Selected)
+            {
+                back = e.CellStyle.SelectionBackColor;
+                fore = e.CellStyle.SelectionForeColor;
+            }
 
             using (var backBrush = new SolidBrush(back))
                 e.Graphics.FillRectangle(backBrush, e.CellBounds);
