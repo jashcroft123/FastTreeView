@@ -1,0 +1,6 @@
+C:\Users\jashc\Desktop\FastTreeView\bin\Release\FastTreeView.dll
+C:\Users\jashc\Desktop\FastTreeView\bin\Release\FastTreeView.pdb
+C:\Users\jashc\Desktop\FastTreeView\obj\Release\FastTreeView.csproj.AssemblyReference.cache
+C:\Users\jashc\Desktop\FastTreeView\obj\Release\FastTreeView.csproj.CoreCompileInputs.cache
+C:\Users\jashc\Desktop\FastTreeView\obj\Release\FastTreeView.dll
+C:\Users\jashc\Desktop\FastTreeView\obj\Release\FastTreeView.pdb
