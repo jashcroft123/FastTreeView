@@ -4,3 +4,9 @@ C:\Users\jashc\Desktop\FastTreeView\obj\Release\FastTreeView.csproj.AssemblyRefe
 C:\Users\jashc\Desktop\FastTreeView\obj\Release\FastTreeView.csproj.CoreCompileInputs.cache
 C:\Users\jashc\Desktop\FastTreeView\obj\Release\FastTreeView.dll
 C:\Users\jashc\Desktop\FastTreeView\obj\Release\FastTreeView.pdb
+C:\Git\FastTreeView\FastTreeView\CSharp\bin\Release\FastTreeView.dll
+C:\Git\FastTreeView\FastTreeView\CSharp\bin\Release\FastTreeView.pdb
+C:\Git\FastTreeView\FastTreeView\CSharp\obj\Release\FastTreeView.csproj.AssemblyReference.cache
+C:\Git\FastTreeView\FastTreeView\CSharp\obj\Release\FastTreeView.csproj.CoreCompileInputs.cache
+C:\Git\FastTreeView\FastTreeView\CSharp\obj\Release\FastTreeView.dll
+C:\Git\FastTreeView\FastTreeView\CSharp\obj\Release\FastTreeView.pdb
