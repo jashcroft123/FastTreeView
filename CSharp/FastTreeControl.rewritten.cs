@@ -1,6 +1,5 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Drawing;
 using System.Linq;
 using System.Reflection;
@@ -45,7 +44,7 @@ namespace LvControls
         public string Tag;
         public string ParentTag;
         public int Level;
-        public bool IsOpen = false;
+        public bool IsOpen = true;
         public object[] CellValues;
         public Color[] CellBackColors;
         public Color[] CellForeColors;
@@ -62,7 +61,6 @@ namespace LvControls
         {
             Tag = tag;
             ParentTag = parentTag;
-            IsOpen = false;
             CellValues = new object[columnCount];
             CellBackColors = new Color[columnCount];
             CellForeColors = new Color[columnCount];
@@ -92,10 +90,6 @@ namespace LvControls
         private bool isProgrammaticSelection;
         private bool suppressSelectionRestore;
         private ImageList glyphImages = CreateDefaultGlyphImages();
-        private readonly List<string> debugLogEntries = new List<string>();
-        private readonly object debugLogLock = new object();
-        private int lastRebuildRowCount;
-        private long lastRebuildElapsedMs;
 
         private const int IndentPx = 16;
         private const int GlyphSize = 9;
@@ -105,40 +99,6 @@ namespace LvControls
         public event EventHandler<string> ItemDoubleClicked;
         public event EventHandler<string> ItemOpenedClosed;
         public event EventHandler<LvTreeCellClickedEventArgs> CellClicked;
-        public event EventHandler<string> DebugLog;
-
-        public bool EnableDebugLogging { get; set; }
-        public string[] DebugLogEntries => debugLogEntries.ToArray();
-        public string LastDebugEntry => debugLogEntries.Count > 0 ? debugLogEntries[debugLogEntries.Count - 1] : null;
-        public int NodeCount => allItems.Count;
-        public int VisibleRowCount
-        {
-            get
-            {
-                if (visibleRowsDirty)
-                {
-                    if (updateDepth == 0)
-                        RebuildVisibleRows();
-                    else
-                        return CountVisibleRowsFromTree();
-                }
-                return visibleRows.Count;
-            }
-        }
-        public int DisplayedRowCount => grid.DisplayedRowCount(false);
-        public int LastRebuildRowCount => lastRebuildRowCount;
-        public long LastRebuildElapsedMs => lastRebuildElapsedMs;
-
-        public string GetDebugSummary()
-        {
-            return $"nodes={allItems.Count}, flattenedRows={VisibleRowCount}, displayedRows={DisplayedRowCount}, lastRebuildRows={lastRebuildRowCount}, lastRebuildElapsedMs={lastRebuildElapsedMs}, debugEntries={debugLogEntries.Count}";
-        }
-
-        public void ClearDebugLog()
-        {
-            lock (debugLogLock)
-                debugLogEntries.Clear();
-        }
 
         public ImageList GlyphImages
         {
@@ -146,26 +106,6 @@ namespace LvControls
             set
             {
                 glyphImages = value ?? CreateDefaultGlyphImages();
-                grid.Invalidate();
-            }
-        }
-
-        public Color SelectionBackColor
-        {
-            get => grid.DefaultCellStyle.SelectionBackColor;
-            set
-            {
-                grid.DefaultCellStyle.SelectionBackColor = value;
-                grid.Invalidate();
-            }
-        }
-
-        public Color SelectionForeColor
-        {
-            get => grid.DefaultCellStyle.SelectionForeColor;
-            set
-            {
-                grid.DefaultCellStyle.SelectionForeColor = value;
                 grid.Invalidate();
             }
         }
@@ -199,12 +139,6 @@ namespace LvControls
                 }
                 else
                 {
-                    if (!string.IsNullOrEmpty(lockedActiveItemTag))
-                    {
-                        int index = GetVisibleRowIndex(lockedActiveItemTag);
-                        if (index >= 0 && grid.Columns.Count > 0)
-                            grid.CurrentCell = grid.Rows[index].Cells[0];
-                    }
                     SyncSelectionFromGrid();
                 }
             }
@@ -249,12 +183,16 @@ namespace LvControls
             grid.MouseDown += (s, e) =>
             {
                 if (!allowUserSelection)
+                {
                     suppressSelectionRestore = true;
+                }
             };
             grid.MouseUp += (s, e) =>
             {
                 if (!allowUserSelection)
+                {
                     RestoreLockedActiveItem();
+                }
                 suppressSelectionRestore = false;
             };
 
@@ -368,33 +306,51 @@ namespace LvControls
 
         public LvTreeItem AddItem(string tag, string parentTag, int position, string[] values)
         {
-            return AddItemCore(tag, parentTag, position, values, 0, true);
+            if (allItems.ContainsKey(tag))
+                throw new ArgumentException($"Item with tag '{tag}' already exists.");
+
+            var node = new LvTreeItem(tag, parentTag, columnCount);
+            for (int i = 0; i < values.Length && i < columnCount; i++)
+                node.CellValues[i] = values[i];
+
+            if (string.IsNullOrEmpty(parentTag))
+            {
+                node.Level = 0;
+                InsertAt(roots, node, position);
+            }
+            else
+            {
+                if (!allItems.TryGetValue(parentTag, out var parent))
+                    throw new ArgumentException($"Parent tag '{parentTag}' not found.");
+                node.Parent = parent;
+                node.Level = parent.Level + 1;
+                InsertAt(parent.Children, node, position);
+            }
+
+            allItems[tag] = node;
+            MarkDirtyOrRebuild();
+            return node;
         }
 
         public LvTreeItem AddItemToEnd(string tag, string parentTag, string[] values, int glyphIndex = 0)
         {
-            return AddItemCore(tag, parentTag, -1, values, glyphIndex, true);
+            var node = AddItem(tag, parentTag, -1, values);
+            node.GlyphIndex = glyphIndex;
+            return node;
         }
 
         public void AddItemMultiple(IEnumerable<(string tag, string parentTag, int glyphIndex, string[] values)> items)
         {
-            if (items == null) throw new ArgumentNullException(nameof(items));
             BeginUpdate();
             try
             {
                 foreach (var it in items)
-                    AddItemCore(it.tag, it.parentTag, -1, it.values, it.glyphIndex, false);
+                    AddItemToEnd(it.tag, it.parentTag, it.values, it.glyphIndex);
             }
             finally { EndUpdate(); }
         }
 
         public void AddItemMultiple(string[] tags, string[] parentTags, string[,] values)
-        {
-            if (tags == null) throw new ArgumentNullException(nameof(tags));
-            AddItemMultiple(tags, parentTags, Enumerable.Repeat(0, tags.Length).ToArray(), values);
-        }
-
-        public void AddItemMultiple(string[] tags, string[] parentTags, string[][] values)
         {
             if (tags == null) throw new ArgumentNullException(nameof(tags));
             AddItemMultiple(tags, parentTags, Enumerable.Repeat(0, tags.Length).ToArray(), values);
@@ -420,47 +376,13 @@ namespace LvControls
                     for (int c = 0; c < rowValues.Length; c++)
                         rowValues[c] = values[i, c];
                     string parentTag = string.IsNullOrEmpty(parentTags[i]) ? null : parentTags[i];
-                    AddItemCore(tags[i], parentTag, -1, rowValues, glyphIndices[i], false);
-                }
-            }
-            finally { EndUpdate(); }
-        }
-
-        public void AddItemMultiple(string[] tags, string[] parentTags, int[] glyphIndices, string[][] values)
-        {
-            if (tags == null) throw new ArgumentNullException(nameof(tags));
-            if (parentTags == null) throw new ArgumentNullException(nameof(parentTags));
-            if (glyphIndices == null) throw new ArgumentNullException(nameof(glyphIndices));
-            if (values == null) throw new ArgumentNullException(nameof(values));
-
-            int n = tags.Length;
-            if (parentTags.Length != n || glyphIndices.Length != n || values.Length != n)
-                throw new ArgumentException($"Array length mismatch: tags={n}, parentTags={parentTags.Length}, glyphIndices={glyphIndices.Length}, values rows={values.Length}.");
-
-            BeginUpdate();
-            try
-            {
-                for (int i = 0; i < n; i++)
-                {
-                    var rowValues = values[i];
-                    int rowValueCount = rowValues == null ? 0 : rowValues.Length;
-                    var normalizedValues = new string[Math.Min(Math.Max(rowValueCount, 0), columnCount)];
-                    for (int c = 0; c < normalizedValues.Length; c++)
-                        normalizedValues[c] = c < rowValueCount ? rowValues[c] : null;
-                    string parentTag = string.IsNullOrEmpty(parentTags[i]) ? null : parentTags[i];
-                    AddItemCore(tags[i], parentTag, -1, normalizedValues, glyphIndices[i], false);
+                    AddItemToEnd(tags[i], parentTag, rowValues, glyphIndices[i]);
                 }
             }
             finally { EndUpdate(); }
         }
 
         public void AddItemMultiple(string[] tags, int[] itemIndents, string[,] values)
-        {
-            if (tags == null) throw new ArgumentNullException(nameof(tags));
-            AddItemMultiple(tags, itemIndents, Enumerable.Repeat(0, tags.Length).ToArray(), values);
-        }
-
-        public void AddItemMultiple(string[] tags, int[] itemIndents, string[][] values)
         {
             if (tags == null) throw new ArgumentNullException(nameof(tags));
             AddItemMultiple(tags, itemIndents, Enumerable.Repeat(0, tags.Length).ToArray(), values);
@@ -498,88 +420,11 @@ namespace LvControls
                     for (int c = 0; c < rowValues.Length; c++)
                         rowValues[c] = values[i, c];
 
-                    var node = AddItemCore(tags[i], parent?.Tag, -1, rowValues, glyphIndices[i], false);
+                    var node = AddItemToEnd(tags[i], parent?.Tag, rowValues, glyphIndices[i]);
                     ancestry[indent] = node;
                 }
             }
             finally { EndUpdate(); }
-        }
-
-        public void AddItemMultiple(string[] tags, int[] itemIndents, int[] glyphIndices, string[][] values)
-        {
-            if (tags == null) throw new ArgumentNullException(nameof(tags));
-            if (itemIndents == null) throw new ArgumentNullException(nameof(itemIndents));
-            if (glyphIndices == null) throw new ArgumentNullException(nameof(glyphIndices));
-            if (values == null) throw new ArgumentNullException(nameof(values));
-
-            int n = tags.Length;
-            if (itemIndents.Length != n || glyphIndices.Length != n || values.Length != n)
-                throw new ArgumentException($"Array length mismatch: tags={n}, itemIndents={itemIndents.Length}, glyphIndices={glyphIndices.Length}, values rows={values.Length}.");
-
-            var ancestry = new List<LvTreeItem>();
-            BeginUpdate();
-            try
-            {
-                for (int i = 0; i < n; i++)
-                {
-                    int indent = itemIndents[i];
-                    if (indent < 0) throw new ArgumentOutOfRangeException(nameof(itemIndents), "Item indentation cannot be negative.");
-                    while (ancestry.Count > indent + 1)
-                        ancestry.RemoveAt(ancestry.Count - 1);
-                    while (ancestry.Count <= indent)
-                        ancestry.Add(null);
-
-                    LvTreeItem parent = indent > 0 ? ancestry[indent - 1] : null;
-                    if (indent > 0 && parent == null)
-                        throw new InvalidOperationException($"Item '{tags[i]}' requests indent {indent} but no parent exists at the previous level.");
-
-                    var rowValues = values[i];
-                    int rowValueCount = rowValues == null ? 0 : rowValues.Length;
-                    var normalizedValues = new string[Math.Min(Math.Max(rowValueCount, 0), columnCount)];
-                    for (int c = 0; c < normalizedValues.Length; c++)
-                        normalizedValues[c] = c < rowValueCount ? rowValues[c] : null;
-
-                    var node = AddItemCore(tags[i], parent?.Tag, -1, normalizedValues, glyphIndices[i], false);
-                    ancestry[indent] = node;
-                }
-            }
-            finally { EndUpdate(); }
-        }
-
-        private LvTreeItem AddItemCore(string tag, string parentTag, int position, string[] values, int glyphIndex, bool markDirty)
-        {
-            if (allItems.ContainsKey(tag))
-                throw new ArgumentException($"Item with tag '{tag}' already exists.");
-
-            var node = new LvTreeItem(tag, parentTag, columnCount);
-            int count = values == null ? 0 : values.Length;
-            for (int i = 0; i < count && i < columnCount; i++)
-                node.CellValues[i] = values[i];
-
-            if (string.IsNullOrEmpty(parentTag))
-            {
-                node.Level = 0;
-                InsertAt(roots, node, position);
-            }
-            else
-            {
-                if (!allItems.TryGetValue(parentTag, out var parent))
-                    throw new ArgumentException($"Parent tag '{parentTag}' not found.");
-                node.Parent = parent;
-                node.Level = parent.Level + 1;
-                InsertAt(parent.Children, node, position);
-            }
-
-            allItems[tag] = node;
-            node.GlyphIndex = glyphIndex;
-
-            if (markDirty)
-                MarkDirtyOrRebuild();
-            else if (updateDepth > 0)
-                visibleRowsDirty = true;
-            else
-                RebuildVisibleRows();
-            return node;
         }
 
         public void RemoveItem(string tag)
@@ -743,21 +588,25 @@ namespace LvControls
             if (changed) MarkDirtyOrRebuild();
         }
 
+        public LvTreeItem ActiveItem => !string.IsNullOrEmpty(activeItemTag) && allItems.TryGetValue(activeItemTag, out var node) ? node : null;
+
         public LvTreeItem ActiveItem
         {
-            get => !string.IsNullOrEmpty(activeItemTag) && allItems.TryGetValue(activeItemTag, out var node) ? node : null;
+            get => ActiveItemCore;
             set
             {
                 if (value == null) return;
                 bool changed = SetActiveItem(value);
-                if (ensureActiveItemVisible)
+                bool suppressVisualNavigation = !allowUserSelection && !isProgrammaticSelection && (suppressSelectionRestore || !ensureActiveItemVisible);
+
+                if (!suppressVisualNavigation && ensureActiveItemVisible)
                     EnsureVisible(value.Tag);
 
                 int idx = GetVisibleRowIndex(value.Tag);
                 int firstVisible = grid.FirstDisplayedScrollingRowIndex;
                 int visibleCount = grid.DisplayedRowCount(false);
                 bool isVisible = firstVisible >= 0 && idx >= firstVisible && idx < firstVisible + visibleCount;
-                if (ensureActiveItemVisible && idx >= 0 && !isVisible)
+                if (!suppressVisualNavigation && ensureActiveItemVisible && idx >= 0 && !isVisible)
                     grid.FirstDisplayedScrollingRowIndex = idx;
 
                 isProgrammaticSelection = true;
@@ -1002,43 +851,15 @@ namespace LvControls
 
         public void ExpandAll()
         {
-            LogDebug($"ExpandAll start nodes={allItems.Count}");
             BeginUpdate();
-            try
-            {
-                bool changed = false;
-                foreach (var node in allItems.Values)
-                {
-                    if (!node.IsOpen)
-                    {
-                        node.IsOpen = true;
-                        changed = true;
-                    }
-                }
-                if (changed) MarkDirtyOrRebuild();
-                LogDebug($"ExpandAll complete changed={changed}");
-            }
+            try { foreach (var node in allItems.Values) node.IsOpen = true; }
             finally { EndUpdate(); }
         }
 
         public void CollapseAll()
         {
-            LogDebug($"CollapseAll start nodes={allItems.Count}");
             BeginUpdate();
-            try
-            {
-                bool changed = false;
-                foreach (var node in allItems.Values)
-                {
-                    if (node.IsOpen)
-                    {
-                        node.IsOpen = false;
-                        changed = true;
-                    }
-                }
-                if (changed) MarkDirtyOrRebuild();
-                LogDebug($"CollapseAll complete changed={changed}");
-            }
+            try { foreach (var node in allItems.Values) node.IsOpen = false; }
             finally { EndUpdate(); }
         }
 
@@ -1049,7 +870,9 @@ namespace LvControls
             while (parent != null)
             {
                 if (!parent.IsOpen)
+                {
                     parent.IsOpen = true;
+                }
                 parent = parent.Parent;
             }
             MarkDirtyOrRebuild();
@@ -1103,22 +926,6 @@ namespace LvControls
             finally { EndUpdate(); }
         }
 
-        private int CountVisibleRowsFromTree()
-        {
-            int count = 0;
-            void Walk(List<LvTreeItem> siblings)
-            {
-                foreach (var node in siblings)
-                {
-                    count++;
-                    if (node.IsOpen && node.HasChildren)
-                        Walk(node.Children);
-                }
-            }
-            Walk(roots);
-            return count;
-        }
-
         private void InvalidateRowIfVisible(LvTreeItem node)
         {
             if (updateDepth > 0) return;
@@ -1148,58 +955,25 @@ namespace LvControls
             RebuildVisibleRows();
         }
 
-        private void LogDebug(string message)
-        {
-            if (!EnableDebugLogging) return;
-            var entry = $"{DateTime.UtcNow:HH:mm:ss.fff} {message}";
-            lock (debugLogLock)
-            {
-                debugLogEntries.Add(entry);
-                while (debugLogEntries.Count > 200)
-                    debugLogEntries.RemoveAt(0);
-            }
-            Debug.WriteLine(entry);
-            Trace.WriteLine(entry);
-            DebugLog?.Invoke(this, entry);
-        }
-
         private void RebuildVisibleRows()
         {
-            var stopwatch = Stopwatch.StartNew();
             visibleRowsDirty = false;
-            visibleRows = new List<LvTreeItem>(Math.Max(roots.Count, 16));
+            visibleRows = new List<LvTreeItem>(allItems.Count);
             visibleRowIndexByTag.Clear();
-
-            var stack = new Stack<LvTreeItem>(Math.Max(roots.Count, 16));
-            for (int i = roots.Count - 1; i >= 0; i--)
+            void Walk(List<LvTreeItem> siblings)
             {
-                var root = roots[i];
-                if (root != null)
-                    stack.Push(root);
-            }
-
-            while (stack.Count > 0)
-            {
-                var node = stack.Pop();
-                visibleRows.Add(node);
-                visibleRowIndexByTag[node.Tag] = visibleRows.Count - 1;
-                if (node.IsOpen && node.HasChildren)
+                foreach (var s in siblings)
                 {
-                    var children = node.Children;
-                    for (int i = children.Count - 1; i >= 0; i--)
-                        stack.Push(children[i]);
+                    visibleRows.Add(s);
+                    visibleRowIndexByTag[s.Tag] = visibleRows.Count - 1;
+                    if (s.IsOpen && s.HasChildren)
+                        Walk(s.Children);
                 }
             }
-
+            Walk(roots);
             grid.RowCount = visibleRows.Count;
-            if (!allowUserSelection)
-                ClearGridSelectionState();
+            ClearGridSelectionState();
             grid.Invalidate();
-            stopwatch.Stop();
-            lastRebuildRowCount = visibleRows.Count;
-            lastRebuildElapsedMs = stopwatch.ElapsedMilliseconds;
-            int displayedRows = grid.DisplayedRowCount(false);
-            LogDebug($"RebuildVisibleRows flattenedRows={visibleRows.Count} displayedRows={displayedRows} roots={roots.Count} elapsedMs={lastRebuildElapsedMs}");
         }
 
         private void Grid_CellValueNeeded(object sender, DataGridViewCellValueEventArgs e)
@@ -1245,6 +1019,7 @@ namespace LvControls
                     textLeft += glyphSize.Width + 4;
                 }
             }
+
             var text = node.CellValues.Length > e.ColumnIndex ? node.CellValues[e.ColumnIndex]?.ToString() : "";
             var flags = GetTextFormatFlags(e.CellStyle.Alignment);
             TextRenderer.DrawText(e.Graphics, text, e.CellStyle.Font, new Rectangle(textLeft, e.CellBounds.Top, e.CellBounds.Right - textLeft, e.CellBounds.Height), fore, flags);
@@ -1272,13 +1047,6 @@ namespace LvControls
             if (e.RowIndex < 0 || e.RowIndex >= visibleRows.Count || e.ColumnIndex < 0) return;
             var node = visibleRows[e.RowIndex];
             CellClicked?.Invoke(this, new LvTreeCellClickedEventArgs(node.Tag, e.ColumnIndex, IsGlyphHit(node, e), IsExpanderHit(node, e)));
-        }
-
-        private void Grid_CellDoubleClick(object sender, DataGridViewCellEventArgs e)
-        {
-            if (e.RowIndex < 0 || e.RowIndex >= visibleRows.Count) return;
-            var node = visibleRows[e.RowIndex];
-            ItemDoubleClicked?.Invoke(this, node.Tag);
         }
 
         private bool IsExpanderHit(LvTreeItem node, DataGridViewCellMouseEventArgs e)
@@ -1322,12 +1090,10 @@ namespace LvControls
                     return;
                 }
             }
-            using (var pen = new Pen(SystemColors.ControlText))
-            {
-                g.DrawRectangle(pen, x + 1, y + 1, size.Width - 2, size.Height - 2);
-                g.DrawLine(pen, x + 2, y + size.Height / 2, x + size.Width - 3, y + size.Height / 2);
-                if (!isOpen) g.DrawLine(pen, x + size.Width / 2, y + 2, x + size.Width / 2, y + size.Height - 3);
-            }
+            using var pen = new Pen(SystemColors.ControlText);
+            g.DrawRectangle(pen, x + 1, y + 1, size.Width - 2, size.Height - 2);
+            g.DrawLine(pen, x + 2, y + size.Height / 2, x + size.Width - 3, y + size.Height / 2);
+            if (!isOpen) g.DrawLine(pen, x + size.Width / 2, y + 2, x + size.Width / 2, y + size.Height - 3);
         }
 
         private Size GetGlyphSize(Graphics g, bool isOpen)
@@ -1357,35 +1123,29 @@ namespace LvControls
 
         private bool HasGlyph(LvTreeItem node) => node.GlyphIndex > 0 && node.GlyphIndex < glyphImages.Images.Count;
 
-        private static TextFormatFlags GetTextFormatFlags(DataGridViewContentAlignment alignment)
+        private static TextFormatFlags GetTextFormatFlags(DataGridViewContentAlignment alignment) => alignment switch
         {
-            if (alignment == DataGridViewContentAlignment.MiddleRight)
-                return TextFormatFlags.Right;
-            if (alignment == DataGridViewContentAlignment.MiddleCenter)
-                return TextFormatFlags.HorizontalCenter;
-            return TextFormatFlags.Left;
-        }
+            DataGridViewContentAlignment.MiddleRight => TextFormatFlags.Right,
+            DataGridViewContentAlignment.MiddleCenter => TextFormatFlags.HorizontalCenter,
+            _ => TextFormatFlags.Left
+        };
 
         private static Bitmap DrawCheckBoxGlyph(bool isChecked)
         {
             var bitmap = new Bitmap(16, 16);
-            using (var graphics = Graphics.FromImage(bitmap))
+            using var graphics = Graphics.FromImage(bitmap);
+            graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            var bounds = new Rectangle(2, 2, 11, 11);
+            using var fill = new SolidBrush(isChecked ? Color.FromArgb(0, 120, 215) : Color.White);
+            graphics.FillRectangle(fill, bounds);
+            using var border = new Pen(Color.FromArgb(90, 90, 90));
+            graphics.DrawRectangle(border, bounds);
+            if (isChecked)
             {
-                graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-                var bounds = new Rectangle(2, 2, 11, 11);
-                using (var fill = new SolidBrush(isChecked ? Color.FromArgb(0, 120, 215) : Color.White))
-                    graphics.FillRectangle(fill, bounds);
-                using (var border = new Pen(Color.FromArgb(90, 90, 90)))
-                    graphics.DrawRectangle(border, bounds);
-                if (isChecked)
-                {
-                    using (var check = new Pen(Color.White, 2f))
-                    {
-                        check.StartCap = System.Drawing.Drawing2D.LineCap.Round;
-                        check.EndCap = System.Drawing.Drawing2D.LineCap.Round;
-                        graphics.DrawLines(check, new[] { new Point(4, 7), new Point(6, 10), new Point(11, 4) });
-                    }
-                }
+                using var check = new Pen(Color.White, 2f);
+                check.StartCap = System.Drawing.Drawing2D.LineCap.Round;
+                check.EndCap = System.Drawing.Drawing2D.LineCap.Round;
+                graphics.DrawLines(check, new[] { new Point(4, 7), new Point(6, 10), new Point(11, 4) });
             }
             return bitmap;
         }
@@ -1393,14 +1153,12 @@ namespace LvControls
         private static Bitmap DrawPowerGlyph(Color color)
         {
             var bitmap = new Bitmap(16, 16);
-            using (var graphics = Graphics.FromImage(bitmap))
-            {
-                graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-                using (var brush = new SolidBrush(color))
-                    graphics.FillEllipse(brush, 2, 2, 12, 12);
-                using (var innerBrush = new SolidBrush(Color.White))
-                    graphics.FillEllipse(innerBrush, 5, 5, 6, 6);
-            }
+            using var graphics = Graphics.FromImage(bitmap);
+            graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using var brush = new SolidBrush(color);
+            graphics.FillEllipse(brush, 2, 2, 12, 12);
+            using var innerBrush = new SolidBrush(Color.White);
+            graphics.FillEllipse(innerBrush, 5, 5, 6, 6);
             return bitmap;
         }
     }
