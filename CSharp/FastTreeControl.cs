@@ -113,6 +113,7 @@ namespace LvControls
         private bool allowUserSelection = true;
         private bool ensureActiveItemVisible = true;
         private bool suppressingUserSelection = false;
+        private bool suppressSelectionRestoreForNextInteraction = false;
         // Set to true while ActiveItem/ActiveItemTag is being set programmatically so
         // the SelectionChanged handler never clears a programmatic highlight.
         private bool isProgrammaticSelection = false;
@@ -179,9 +180,12 @@ namespace LvControls
                 {
                     lockedActiveItemTag = ActiveItem?.Tag;
                 }
+                if (!allowUserSelection)
+                    ClearGridSelectionStateOnNextTick();
+                else
+                    SyncSelectionFromGrid();
             }
         }
-
         public LvTreeGrid()
         {
             InitializeGrid();
@@ -220,11 +224,17 @@ namespace LvControls
             grid.MouseDown += (s, e) =>
             {
                 if (!allowUserSelection)
+                {
                     suppressingUserSelection = true;
+                    suppressSelectionRestoreForNextInteraction = true;
+                }
             };
             grid.MouseUp += (s, e) =>
             {
+                if (!allowUserSelection)
+                    RestoreLockedActiveItem();
                 suppressingUserSelection = false;
+                suppressSelectionRestoreForNextInteraction = false;
             };
             grid.KeyDown += (s, e) =>
             {
@@ -238,17 +248,49 @@ namespace LvControls
                     e.SuppressKeyPress = true;
                 }
             };
+            grid.HandleCreated += (s, e) =>
+            {
+                if (!allowUserSelection)
+                    ClearGridSelectionStateOnNextTick();
+            };
+            grid.VisibleChanged += (s, e) =>
+            {
+                if (!allowUserSelection && grid.Visible)
+                    ClearGridSelectionStateOnNextTick();
+            };
+            grid.Enter += (s, e) =>
+            {
+                if (!allowUserSelection)
+                    ClearGridSelectionStateOnNextTick();
+            };
+            grid.GotFocus += (s, e) =>
+            {
+                if (!allowUserSelection)
+                    ClearGridSelectionStateOnNextTick();
+            };
 
             grid.SelectionChanged += (s, e) =>
             {
                 // Only block user-initiated selection changes, never programmatic ones.
+                if (suppressSelectionRestoreForNextInteraction && !isProgrammaticSelection)
+                {
+                    suppressSelectionRestoreForNextInteraction = false;
+                    return;
+                }
                 if (suppressingUserSelection && !isProgrammaticSelection)
+                {
                     RestoreLockedActiveItem();
-                else
-                    SyncSelectionFromGrid();
+                    return;
+                }
+                SyncSelectionFromGrid();
             };
             grid.CurrentCellChanged += (s, e) =>
             {
+                if (suppressSelectionRestoreForNextInteraction && !isProgrammaticSelection)
+                {
+                    suppressSelectionRestoreForNextInteraction = false;
+                    return;
+                }
                 if (suppressingUserSelection || isProgrammaticSelection) return;
                 int rowIndex = grid.CurrentCell?.RowIndex ?? -1;
                 if (rowIndex >= 0 && rowIndex < visibleRows.Count && SetActiveItem(visibleRows[rowIndex]))
@@ -560,6 +602,74 @@ namespace LvControls
         }
 
         /// <summary>
+        /// LabVIEW-style overload that infers each item's parent from its indentation level.
+        /// A value of 0 creates a root item. A value of 1 makes the item a child of the
+        /// previous item at level 0, and larger values follow the nearest ancestor at the
+        /// preceding indentation level. This matches the common LabVIEW tree-building convention.
+        /// </summary>
+        public void AddItemMultiple(string[] tags, int[] itemIndents, string[,] values)
+        {
+            if (tags == null) throw new ArgumentNullException(nameof(tags));
+            AddItemMultiple(tags, itemIndents, Enumerable.Repeat(0, tags.Length).ToArray(), values);
+        }
+
+        /// <summary>
+        /// Adds multiple items using indentation levels to infer each item's parent in a
+        /// LabVIEW-style tree build. The indentation level is resolved against the previously
+        /// added items, so increasing indentation makes the new item a child of the previous
+        /// item at the parent level.
+        /// </summary>
+        public void AddItemMultiple(string[] tags, int[] itemIndents, int[] glyphIndices, string[,] values)
+        {
+            if (tags == null) throw new ArgumentNullException(nameof(tags));
+            if (itemIndents == null) throw new ArgumentNullException(nameof(itemIndents));
+            if (glyphIndices == null) throw new ArgumentNullException(nameof(glyphIndices));
+            if (values == null) throw new ArgumentNullException(nameof(values));
+
+            int n = tags.Length;
+            if (itemIndents.Length != n || glyphIndices.Length != n || values.GetLength(0) != n)
+                throw new ArgumentException(
+                    $"Array length mismatch: tags={n}, itemIndents={itemIndents.Length}, " +
+                    $"glyphIndices={glyphIndices.Length}, values rows={values.GetLength(0)}. " +
+                    "All must match.");
+
+            int cols = values.GetLength(1);
+            var ancestry = new List<LvTreeItem>();
+
+            BeginUpdate();
+            try
+            {
+                for (int i = 0; i < n; i++)
+                {
+                    var rowValues = new string[cols];
+                    for (int c = 0; c < cols; c++)
+                        rowValues[c] = values[i, c];
+
+                    int indent = itemIndents[i];
+                    if (indent < 0)
+                        throw new ArgumentOutOfRangeException(nameof(itemIndents), "Item indentation cannot be negative.");
+
+                    while (ancestry.Count > indent + 1)
+                        ancestry.RemoveAt(ancestry.Count - 1);
+                    while (ancestry.Count <= indent)
+                        ancestry.Add(null);
+
+                    LvTreeItem parent = null;
+                    if (indent > 0)
+                    {
+                        parent = ancestry[indent - 1];
+                        if (parent == null)
+                            throw new InvalidOperationException($"Item '{tags[i]}' requests indent {indent} but no parent exists at the previous level.");
+                    }
+
+                    var node = AddItemToEnd(tags[i], parent?.Tag, rowValues, glyphIndices[i]);
+                    ancestry[indent] = node;
+                }
+            }
+            finally { EndUpdate(); }
+        }
+
+        /// <summary>
         /// Bulk updates cell values for multiple items, starting at the specified column index.
         /// Parallel 1D array of tags, start column index, and 2D array of string values
         /// (rows = items matching the tags, columns = new cell values starting from columnStartIndex).
@@ -831,7 +941,11 @@ namespace LvControls
             {
                 if (value == null) return;
                 bool changed = SetActiveItem(value);
-                if (ensureActiveItemVisible)
+                bool suppressVisualNavigation = !allowUserSelection
+                    && (suppressingUserSelection || suppressSelectionRestoreForNextInteraction)
+                    && !isProgrammaticSelection;
+
+                if (!suppressVisualNavigation && ensureActiveItemVisible)
                     EnsureVisible(value.Tag);
                 var idx = visibleRows.FindIndex(n => n.Tag == value.Tag);
 
@@ -843,19 +957,25 @@ namespace LvControls
                 bool isVisible = firstVisible >= 0
                               && idx >= firstVisible
                               && idx < firstVisible + visibleCount;
-                if (ensureActiveItemVisible && idx >= 0 && !isVisible)
+                if (!suppressVisualNavigation && ensureActiveItemVisible && idx >= 0 && !isVisible)
                     grid.FirstDisplayedScrollingRowIndex = idx;
 
                 isProgrammaticSelection = true;
                 try
                 {
-                    // Clear the prior visible selection even if the new active item
-                    // is hidden or off-screen. Its Active state will paint when shown.
-                    grid.ClearSelection();
-                    if (idx >= 0 && grid.Columns.Count > 0 && (ensureActiveItemVisible || isVisible))
-                        grid.CurrentCell = grid.Rows[idx].Cells[0];
                     if (!allowUserSelection)
+                    {
                         lockedActiveItemTag = value.Tag;
+                    }
+                    else
+                    {
+                        // Clear the prior visible selection even if the new active item
+                        // is hidden or off-screen. Its Active state will paint when shown.
+                        if (!suppressVisualNavigation)
+                            grid.ClearSelection();
+                        if (!suppressVisualNavigation && idx >= 0 && grid.Columns.Count > 0 && (ensureActiveItemVisible || isVisible))
+                            grid.CurrentCell = grid.Rows[idx].Cells[0];
+                    }
                 }
                 finally { isProgrammaticSelection = false; }
 
@@ -872,11 +992,21 @@ namespace LvControls
                 if (string.IsNullOrEmpty(value))
                 {
                     bool changed = SetActiveItem(null);
+                    bool suppressVisualNavigation = !allowUserSelection
+                        && (suppressingUserSelection || suppressSelectionRestoreForNextInteraction)
+                        && !isProgrammaticSelection;
                     isProgrammaticSelection = true;
                     try
                     {
-                        grid.ClearSelection();
-                        grid.CurrentCell = null;
+                        if (!allowUserSelection)
+                        {
+                            lockedActiveItemTag = null;
+                        }
+                        else if (!suppressVisualNavigation)
+                        {
+                            grid.ClearSelection();
+                            grid.CurrentCell = null;
+                        }
                     }
                     finally { isProgrammaticSelection = false; }
                     if (!allowUserSelection)
@@ -938,7 +1068,7 @@ namespace LvControls
         private void RestoreLockedActiveItem()
         {
             isProgrammaticSelection = true;
-            try
+            if (allowUserSelection)
             {
                 grid.ClearSelection();
                 if (!string.IsNullOrEmpty(lockedActiveItemTag))
@@ -953,9 +1083,9 @@ namespace LvControls
                     grid.CurrentCell = null;
                 }
             }
-            finally
+            else
             {
-                isProgrammaticSelection = false;
+                grid.ClearSelection();
             }
         }
 
@@ -1305,6 +1435,26 @@ namespace LvControls
             if (idx >= 0) grid.InvalidateRow(idx);
         }
 
+        private void ClearGridSelectionStateOnNextTick()
+        {
+            if (grid.IsDisposed) return;
+            if (grid.IsHandleCreated)
+                grid.BeginInvoke(new Action(ClearGridSelectionState));
+            else
+                ClearGridSelectionState();
+        }
+
+        private void ClearGridSelectionState()
+        {
+            if (grid.IsDisposed) return;
+            grid.ClearSelection();
+            if (grid.Columns.Count > 0)
+                grid.CurrentCell = null;
+            foreach (var node in allItems.Values)
+                node.Selected = false;
+            selectedTags.Clear();
+        }
+
         // ---------------------------------------------------------------
         // Internal: flatten hierarchy into visibleRows, respecting IsOpen
         // ---------------------------------------------------------------
@@ -1332,6 +1482,8 @@ namespace LvControls
             Walk(roots);
 
             grid.RowCount = visibleRows.Count;
+            if (!allowUserSelection)
+                ClearGridSelectionStateOnNextTick();
             grid.Invalidate();
         }
 
@@ -1464,13 +1616,18 @@ namespace LvControls
             Point gridPoint = new Point(e.X, e.Y);
             Point cellPoint = new Point(cellRect.Left + e.X, cellRect.Top + e.Y);
             if (glyphRect.Contains(gridPoint) || glyphRect.Contains(cellPoint))
+            {
+                suppressSelectionRestoreForNextInteraction = true;
                 ItemSetOpen(node.Tag, !node.IsOpen);
+            }
         }
 
         private void Grid_CellMouseUp(object sender, DataGridViewCellMouseEventArgs e)
         {
             if (e.Button != MouseButtons.Left) return;
             if (e.RowIndex < 0 || e.RowIndex >= visibleRows.Count || e.ColumnIndex < 0) return;
+            if (!allowUserSelection)
+                suppressSelectionRestoreForNextInteraction = true;
             var node = visibleRows[e.RowIndex];
             CellClicked?.Invoke(this, new LvTreeCellClickedEventArgs(
                 node.Tag,
