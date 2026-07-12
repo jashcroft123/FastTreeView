@@ -8,6 +8,32 @@ using System.Windows.Forms.VisualStyles;
 
 namespace LvControls
 {
+    /// <summary>Built-in indices in <see cref="LvTreeGrid.GlyphImages"/>.</summary>
+    public enum LvTreeGlyph
+    {
+        None = 0,
+        Unchecked = 1,
+        Checked = 2,
+        Startup = 3,
+        Shutdown = 4
+    }
+
+    /// <summary>Details of a tree-cell click.</summary>
+    public sealed class LvTreeCellClickedEventArgs : EventArgs
+    {
+        public string Tag { get; }
+        public int ColumnIndex { get; }
+        /// <summary>True when the click was on the expander or optional item glyph.</summary>
+        public bool IsGlyphOrExpander { get; }
+
+        public LvTreeCellClickedEventArgs(string tag, int columnIndex, bool isGlyphOrExpander)
+        {
+            Tag = tag;
+            ColumnIndex = columnIndex;
+            IsGlyphOrExpander = isGlyphOrExpander;
+        }
+    }
+
     /// <summary>
     /// One tree item. Roughly equivalent to a row in LabVIEW's Tree "Items[]" array,
     /// but also holds per-cell colour so painting is O(1) per visible cell.
@@ -23,6 +49,10 @@ namespace LvControls
         public Color[] CellForeColors;     // per-cell text colour
         public Color RowBackColor = Color.Empty; // used when a cell colour isn't set
         public bool Selected;
+        /// <summary>True when this is the tree's active item, even if it is off-screen.</summary>
+        public bool Active;
+        /// <summary>Index in <see cref="LvTreeGrid.GlyphImages"/>; zero means no glyph.</summary>
+        public int GlyphIndex = 0;
 
         public LvTreeItem Parent;
         public readonly List<LvTreeItem> Children = new List<LvTreeItem>();
@@ -71,10 +101,16 @@ namespace LvControls
         private int updateDepth = 0;
         private bool visibleRowsDirty = false;
         private bool allowUserSelection = true;
+        private bool ensureActiveItemVisible = true;
         private bool suppressingUserSelection = false;
         // Set to true while ActiveItem/ActiveItemTag is being set programmatically so
         // the SelectionChanged handler never clears a programmatic highlight.
         private bool isProgrammaticSelection = false;
+        // The active item to retain while user selection is disabled. A click can
+        // change DataGridView.CurrentCell even after its selection is cleared.
+        private string lockedActiveItemTag;
+        private string activeItemTag;
+        private ImageList glyphImages = CreateDefaultGlyphImages();
 
         private const int IndentPx = 16;
         private const int GlyphSize = 9;
@@ -82,6 +118,42 @@ namespace LvControls
         public event EventHandler<string> ActiveItemChanged;
         public event EventHandler<string> ItemDoubleClicked;
         public event EventHandler<string> ItemOpenedClosed;
+        /// <summary>Raised when a data cell is clicked; inspect IsGlyphOrExpander for first-column glyph clicks.</summary>
+        public event EventHandler<LvTreeCellClickedEventArgs> CellClicked;
+
+        /// <summary>
+        /// Images available for the optional glyph displayed to the left of each
+        /// item's first-column text.
+        /// </summary>
+        public ImageList GlyphImages
+        {
+            get => glyphImages;
+            set
+            {
+                glyphImages = value;
+                grid.Invalidate();
+            }
+        }
+
+        /// <summary>
+        /// Creates the built-in unchecked, checked, startup, and shutdown glyphs.
+        /// Use this to restore the defaults after assigning a custom image list.
+        /// </summary>
+        public static ImageList CreateDefaultGlyphImages()
+        {
+            var images = new ImageList
+            {
+                ColorDepth = ColorDepth.Depth32Bit,
+                ImageSize = new Size(16, 16),
+                TransparentColor = Color.Transparent
+            };
+            images.Images.Add(new Bitmap(16, 16));
+            images.Images.Add(DrawCheckBoxGlyph(false));
+            images.Images.Add(DrawCheckBoxGlyph(true));
+            images.Images.Add(DrawPowerGlyph(Color.FromArgb(40, 145, 65)));
+            images.Images.Add(DrawPowerGlyph(Color.FromArgb(190, 55, 45)));
+            return images;
+        }
 
         /// <summary>
         /// When false, the user cannot select rows by clicking or keyboard navigation.
@@ -95,7 +167,7 @@ namespace LvControls
                 allowUserSelection = value;
                 if (!allowUserSelection)
                 {
-                    grid.ClearSelection();
+                    lockedActiveItemTag = ActiveItem?.Tag;
                 }
             }
         }
@@ -129,6 +201,7 @@ namespace LvControls
 
             grid.CellValueNeeded += Grid_CellValueNeeded;
             grid.CellPainting += Grid_CellPainting;
+            grid.CellMouseDown += Grid_CellMouseDown;
             grid.CellMouseClick += Grid_CellMouseClick;
             grid.CellDoubleClick += Grid_CellDoubleClick;
 
@@ -160,11 +233,17 @@ namespace LvControls
             {
                 // Only block user-initiated selection changes, never programmatic ones.
                 if (suppressingUserSelection && !isProgrammaticSelection)
-                    grid.ClearSelection();
+                    RestoreLockedActiveItem();
                 else
                     SyncSelectionFromGrid();
             };
-            grid.CurrentCellChanged += (s, e) => ActiveItemChanged?.Invoke(this, ActiveItem?.Tag);
+            grid.CurrentCellChanged += (s, e) =>
+            {
+                if (suppressingUserSelection || isProgrammaticSelection) return;
+                int rowIndex = grid.CurrentCell?.RowIndex ?? -1;
+                if (rowIndex >= 0 && rowIndex < visibleRows.Count && SetActiveItem(visibleRows[rowIndex]))
+                    ActiveItemChanged?.Invoke(this, activeItemTag);
+            };
 
             Controls.Add(grid);
         }
@@ -380,42 +459,76 @@ namespace LvControls
         }
 
         /// <summary>
+        /// When true, assigning ActiveItem or ActiveItemTag expands the item's
+        /// ancestors and scrolls it into view. The default preserves LabVIEW-like
+        /// active-item behavior.
+        /// </summary>
+        public bool EnsureActiveItemVisible
+        {
+            get => ensureActiveItemVisible;
+            set => ensureActiveItemVisible = value;
+        }
+
+        /// <summary>Adds an item after its existing siblings.</summary>
+        public LvTreeItem AddItemToEnd(string tag, string parentTag, string[] values, int glyphIndex = 0)
+        {
+            var node = AddItem(tag, parentTag, -1, values);
+            node.GlyphIndex = glyphIndex;
+            return node;
+        }
+
+        /// <summary>
         /// C#-side convenience overload. Not usable from LabVIEW - .NET interop
         /// can't marshal tuples or IEnumerable&lt;T&gt; across the boundary.
         /// Use the array-based overload below from a VI.
         /// </summary>
-        public void AddItemMultiple(IEnumerable<(string tag, string parentTag, int position, string[] values)> items)
+        public void AddItemMultiple(IEnumerable<(string tag, string parentTag, int glyphIndex, string[] values)> items)
         {
             BeginUpdate();
             try
             {
                 foreach (var it in items)
-                    AddItem(it.tag, it.parentTag, it.position, it.values);
+                    AddItemToEnd(it.tag, it.parentTag, it.values, it.glyphIndex);
             }
             finally { EndUpdate(); }
         }
 
         /// <summary>
-        /// LabVIEW-callable version of Add Item.Multiple.
-        /// Parallel 1D arrays for tag/parentTag/position, plus one 2D array for
+        /// LabVIEW-callable version of Add Multiple Items to End.
+        /// Parallel 1D arrays for tag/parentTag/glyphIndex, plus one 2D array for
         /// cell values (rows = items, columns = your column count). LabVIEW's
         /// 2D array of strings maps directly onto a .NET string[,] via the .NET
         /// Constructor/Invoke Node, so this is the shape to build on the block
         /// diagram - no need to construct .NET objects or arrays-of-arrays.
         ///
-        /// All four/five inputs must agree on row count:
-        ///   tags.Length == parentTags.Length == positions.Length == values.GetLength(0)
+        /// All inputs must agree on row count:
+        ///   tags.Length == parentTags.Length == glyphIndices.Length == values.GetLength(0)
         /// parentTags: use "" (not null) for a root item - LabVIEW string
         /// controls/arrays can't carry a null.
+        /// glyphIndices: use 0 for no glyph; other values select GlyphImages.Images.
+        /// Items are appended after their existing siblings in the supplied order.
         /// </summary>
-        public void AddItemMultiple(string[] tags, string[] parentTags, int[] positions, string[,] values)
+        public void AddItemMultiple(string[] tags, string[] parentTags, string[,] values)
         {
             if (tags == null) throw new ArgumentNullException(nameof(tags));
+            AddItemMultiple(tags, parentTags, Enumerable.Repeat(0, tags.Length).ToArray(), values);
+        }
+
+        /// <summary>
+        /// Adds multiple items after their existing siblings in the supplied order,
+        /// assigning an optional first-column glyph to each item.
+        /// </summary>
+        public void AddItemMultiple(string[] tags, string[] parentTags, int[] glyphIndices, string[,] values)
+        {
+            if (tags == null) throw new ArgumentNullException(nameof(tags));
+            if (parentTags == null) throw new ArgumentNullException(nameof(parentTags));
+            if (glyphIndices == null) throw new ArgumentNullException(nameof(glyphIndices));
+            if (values == null) throw new ArgumentNullException(nameof(values));
             int n = tags.Length;
-            if (parentTags.Length != n || positions.Length != n || values.GetLength(0) != n)
+            if (parentTags.Length != n || glyphIndices.Length != n || values.GetLength(0) != n)
                 throw new ArgumentException(
                     $"Array length mismatch: tags={n}, parentTags={parentTags.Length}, " +
-                    $"positions={positions.Length}, values rows={values.GetLength(0)}. " +
+                    $"glyphIndices={glyphIndices.Length}, values rows={values.GetLength(0)}. " +
                     "All must match.");
 
             int cols = values.GetLength(1);
@@ -423,17 +536,14 @@ namespace LvControls
             BeginUpdate();
             try
             {
-                // Iterate in reverse so that item [0] ends up at the top when
-                // inserting at position 0 (each insertion pushes prior items down,
-                // so the last-inserted item wins the top slot).
-                for (int i = n - 1; i >= 0; i--)
+                for (int i = 0; i < n; i++)
                 {
                     var rowValues = new string[cols];
                     for (int c = 0; c < cols; c++)
                         rowValues[c] = values[i, c];
 
                     string parentTag = string.IsNullOrEmpty(parentTags[i]) ? null : parentTags[i];
-                    AddItem(tags[i], parentTag, positions[i], rowValues);
+                    AddItemToEnd(tags[i], parentTag, rowValues, glyphIndices[i]);
                 }
             }
             finally { EndUpdate(); }
@@ -496,6 +606,9 @@ namespace LvControls
         {
             if (!allItems.TryGetValue(tag, out var node)) return;
 
+            if (string.Equals(activeItemTag, tag, StringComparison.Ordinal))
+                SetActiveItem(null);
+
             // recursively drop children first
             foreach (var child in node.Children.ToArray())
                 RemoveItem(child.Tag);
@@ -515,6 +628,8 @@ namespace LvControls
 
         public void RemoveItemAll()
         {
+            SetActiveItem(null);
+            selectedTags.Clear();
             allItems.Clear();
             roots.Clear();
             visibleRows.Clear();
@@ -699,17 +814,16 @@ namespace LvControls
 
         public LvTreeItem ActiveItem
         {
-            get
-            {
-                var r = grid.CurrentCell?.RowIndex ?? -1;
-                return (r >= 0 && r < visibleRows.Count) ? visibleRows[r] : null;
-            }
+            get => !string.IsNullOrEmpty(activeItemTag) && allItems.TryGetValue(activeItemTag, out var node)
+                ? node
+                : null;
             set
             {
                 if (value == null) return;
-                EnsureVisible(value.Tag);
+                bool changed = SetActiveItem(value);
+                if (ensureActiveItemVisible)
+                    EnsureVisible(value.Tag);
                 var idx = visibleRows.FindIndex(n => n.Tag == value.Tag);
-                if (idx < 0 || grid.Columns.Count == 0) return;
 
                 // Only scroll if the row is outside the current visible viewport.
                 // Scrolling unconditionally forces the row to the top and triggers
@@ -719,12 +833,24 @@ namespace LvControls
                 bool isVisible = firstVisible >= 0
                               && idx >= firstVisible
                               && idx < firstVisible + visibleCount;
-                if (!isVisible)
+                if (ensureActiveItemVisible && idx >= 0 && !isVisible)
                     grid.FirstDisplayedScrollingRowIndex = idx;
 
                 isProgrammaticSelection = true;
-                try { grid.CurrentCell = grid.Rows[idx].Cells[0]; }
+                try
+                {
+                    // Clear the prior visible selection even if the new active item
+                    // is hidden or off-screen. Its Active state will paint when shown.
+                    grid.ClearSelection();
+                    if (idx >= 0 && grid.Columns.Count > 0 && (ensureActiveItemVisible || isVisible))
+                        grid.CurrentCell = grid.Rows[idx].Cells[0];
+                    if (!allowUserSelection)
+                        lockedActiveItemTag = value.Tag;
+                }
                 finally { isProgrammaticSelection = false; }
+
+                if (changed)
+                    ActiveItemChanged?.Invoke(this, activeItemTag);
             }
         }
 
@@ -735,7 +861,18 @@ namespace LvControls
             {
                 if (string.IsNullOrEmpty(value))
                 {
-                    grid.CurrentCell = null;
+                    bool changed = SetActiveItem(null);
+                    isProgrammaticSelection = true;
+                    try
+                    {
+                        grid.ClearSelection();
+                        grid.CurrentCell = null;
+                    }
+                    finally { isProgrammaticSelection = false; }
+                    if (!allowUserSelection)
+                        lockedActiveItemTag = null;
+                    if (changed)
+                        ActiveItemChanged?.Invoke(this, null);
                 }
                 else if (allItems.TryGetValue(value, out var node))
                 {
@@ -744,7 +881,9 @@ namespace LvControls
             }
         }
 
-        public int ActiveItemIndex => grid.CurrentCell?.RowIndex ?? -1;
+        public int ActiveItemIndex => string.IsNullOrEmpty(activeItemTag)
+            ? -1
+            : visibleRows.FindIndex(n => n.Tag == activeItemTag);
 
         private readonly HashSet<string> selectedTags = new HashSet<string>();
 
@@ -766,6 +905,50 @@ namespace LvControls
             foreach (var n in allItems.Values) n.Selected = selectedTags.Contains(n.Tag);
         }
 
+        private bool SetActiveItem(LvTreeItem node)
+        {
+            string newTag = node?.Tag;
+            if (string.Equals(activeItemTag, newTag, StringComparison.Ordinal)) return false;
+
+            if (!string.IsNullOrEmpty(activeItemTag) && allItems.TryGetValue(activeItemTag, out var oldNode))
+            {
+                oldNode.Active = false;
+                InvalidateRowIfVisible(oldNode);
+            }
+
+            activeItemTag = newTag;
+            if (node != null)
+            {
+                node.Active = true;
+                InvalidateRowIfVisible(node);
+            }
+            return true;
+        }
+
+        private void RestoreLockedActiveItem()
+        {
+            isProgrammaticSelection = true;
+            try
+            {
+                grid.ClearSelection();
+                if (!string.IsNullOrEmpty(lockedActiveItemTag))
+                {
+                    int index = visibleRows.FindIndex(n => n.Tag == lockedActiveItemTag);
+                    grid.CurrentCell = index >= 0 && grid.Columns.Count > 0
+                        ? grid.Rows[index].Cells[0]
+                        : null;
+                }
+                else
+                {
+                    grid.CurrentCell = null;
+                }
+            }
+            finally
+            {
+                isProgrammaticSelection = false;
+            }
+        }
+
         // ---------------------------------------------------------------
         // Colour API - the reason you're moving off native Tree.
         // Whole-row and per-cell colour, both O(1), no property-node-per-item cost.
@@ -775,6 +958,17 @@ namespace LvControls
         {
             if (!allItems.TryGetValue(tag, out var node)) return;
             node.RowBackColor = color;
+            InvalidateRowIfVisible(node);
+        }
+
+        /// <summary>
+        /// Sets the optional first-column glyph for an item. Use 0 to remove it.
+        /// Positive values select an image in <see cref="GlyphImages"/>.
+        /// </summary>
+        public void SetItemGlyphIndex(string tag, int glyphIndex)
+        {
+            if (!allItems.TryGetValue(tag, out var node)) return;
+            node.GlyphIndex = glyphIndex;
             InvalidateRowIfVisible(node);
         }
 
@@ -1050,16 +1244,15 @@ namespace LvControls
                     foreach (var node in allItems.Values)
                     {
                         var valStr = node.CellValues.Length > col ? node.CellValues[col]?.ToString() : "";
-                        if (string.IsNullOrEmpty(valStr)) continue;
-
-                        var size = TextRenderer.MeasureText(g, valStr, colFont);
-                        int width = size.Width + 10;
+                        int width = string.IsNullOrEmpty(valStr) ? 0 : TextRenderer.MeasureText(g, valStr, colFont).Width + 10;
 
                         if (col == 0)
                         {
                             int indent = node.Level * IndentPx;
                             Size glyphSize = GetGlyphSize(g, node.IsOpen);
                             width += indent + glyphSize.Width + 8;
+                            if (HasGlyph(node))
+                                width += glyphImages.ImageSize.Width + 4;
                         }
 
                         if (width > maxWidth)
@@ -1161,7 +1354,7 @@ namespace LvControls
             // Custom painting bypasses DataGridView's normal selection rendering,
             // so apply the inherited selection colours explicitly. This preserves
             // SelectionBackColor/SelectionForeColor set on the control or column.
-            if (node.Selected)
+            if (node.Selected || node.Active)
             {
                 back = e.CellStyle.SelectionBackColor;
                 fore = e.CellStyle.SelectionForeColor;
@@ -1216,6 +1409,15 @@ namespace LvControls
                     Size glyphSize = GetGlyphSize(e.Graphics, false);
                     textLeft += glyphSize.Width + 4;
                 }
+
+                if (HasGlyph(node))
+                {
+                    Image glyph = glyphImages.Images[node.GlyphIndex];
+                    Size glyphSize = glyphImages.ImageSize;
+                    int glyphTop = e.CellBounds.Top + (e.CellBounds.Height - glyphSize.Height) / 2;
+                    e.Graphics.DrawImage(glyph, new Rectangle(textLeft, glyphTop, glyphSize.Width, glyphSize.Height));
+                    textLeft += glyphSize.Width + 4;
+                }
             }
 
             var text = node.CellValues.Length > e.ColumnIndex ? node.CellValues[e.ColumnIndex]?.ToString() : "";
@@ -1228,22 +1430,85 @@ namespace LvControls
             e.Handled = true;
         }
 
-        private void Grid_CellMouseClick(object sender, DataGridViewCellMouseEventArgs e)
+        private void Grid_CellMouseDown(object sender, DataGridViewCellMouseEventArgs e)
         {
             if (e.RowIndex < 0 || e.RowIndex >= visibleRows.Count || e.ColumnIndex != 0) return;
             var node = visibleRows[e.RowIndex];
             if (!node.HasChildren) return;
 
-            // Only toggle if the click landed on/near the glyph, not the label text.
+            // Only toggle if the click landed on the actual expand/collapse glyph.
             var cellRect = grid.GetCellDisplayRectangle(e.ColumnIndex, e.RowIndex, false);
             Size glyphSize;
             using (var g = grid.CreateGraphics())
             {
                 glyphSize = GetGlyphSize(g, node.IsOpen);
             }
-            int glyphRight = cellRect.Left + node.Level * IndentPx + glyphSize.Width + 6;
-            if (e.Location.X <= glyphRight)
+            var glyphRect = new Rectangle(
+                cellRect.Left + node.Level * IndentPx,
+                cellRect.Top + (cellRect.Height - glyphSize.Height) / 2,
+                glyphSize.Width,
+                glyphSize.Height);
+            glyphRect.Inflate(3, 3);
+            // WinForms reports these coordinates relative to the grid on most
+            // versions, but some hosts forward them relative to the cell.
+            Point gridPoint = new Point(e.X, e.Y);
+            Point cellPoint = new Point(cellRect.Left + e.X, cellRect.Top + e.Y);
+            if (glyphRect.Contains(gridPoint) || glyphRect.Contains(cellPoint))
                 ItemSetOpen(node.Tag, !node.IsOpen);
+        }
+
+        private void Grid_CellMouseClick(object sender, DataGridViewCellMouseEventArgs e)
+        {
+            if (e.RowIndex < 0 || e.RowIndex >= visibleRows.Count || e.ColumnIndex < 0) return;
+            var node = visibleRows[e.RowIndex];
+            CellClicked?.Invoke(this, new LvTreeCellClickedEventArgs(
+                node.Tag,
+                e.ColumnIndex,
+                IsGlyphOrExpanderHit(node, e)));
+        }
+
+        private bool IsGlyphOrExpanderHit(LvTreeItem node, DataGridViewCellMouseEventArgs e)
+        {
+            if (e.ColumnIndex != 0) return false;
+
+            var cellRect = grid.GetCellDisplayRectangle(e.ColumnIndex, e.RowIndex, false);
+            Size expanderSize;
+            using (var graphics = grid.CreateGraphics())
+            {
+                expanderSize = GetGlyphSize(graphics, node.IsOpen);
+            }
+
+            int left = cellRect.Left + node.Level * IndentPx;
+            if (node.HasChildren)
+            {
+                var expanderRect = new Rectangle(
+                    left,
+                    cellRect.Top + (cellRect.Height - expanderSize.Height) / 2,
+                    expanderSize.Width,
+                    expanderSize.Height);
+                expanderRect.Inflate(3, 3);
+                if (IsMousePointInRectangle(e, cellRect, expanderRect)) return true;
+            }
+            left += expanderSize.Width + 4;
+
+            if (!HasGlyph(node)) return false;
+            Size itemGlyphSize = glyphImages.ImageSize;
+            var itemGlyphRect = new Rectangle(
+                left,
+                cellRect.Top + (cellRect.Height - itemGlyphSize.Height) / 2,
+                itemGlyphSize.Width,
+                itemGlyphSize.Height);
+            return IsMousePointInRectangle(e, cellRect, itemGlyphRect);
+        }
+
+        private static bool IsMousePointInRectangle(
+            DataGridViewCellMouseEventArgs e,
+            Rectangle cellRect,
+            Rectangle targetRect)
+        {
+            Point gridPoint = new Point(e.X, e.Y);
+            Point cellPoint = new Point(cellRect.Left + e.X, cellRect.Top + e.Y);
+            return targetRect.Contains(gridPoint) || targetRect.Contains(cellPoint);
         }
 
         private void Grid_CellDoubleClick(object sender, DataGridViewCellEventArgs e)
@@ -1268,6 +1533,48 @@ namespace LvControls
             }
             return new Size(GlyphSize, GlyphSize);
         }
+
+        private static Bitmap DrawCheckBoxGlyph(bool isChecked)
+        {
+            var bitmap = new Bitmap(16, 16);
+            using (Graphics graphics = Graphics.FromImage(bitmap))
+            {
+                graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                var bounds = new Rectangle(2, 2, 11, 11);
+                using (var fill = new SolidBrush(isChecked ? Color.FromArgb(0, 120, 215) : Color.White))
+                    graphics.FillRectangle(fill, bounds);
+                using (var border = new Pen(Color.FromArgb(90, 90, 90)))
+                    graphics.DrawRectangle(border, bounds);
+                if (isChecked)
+                {
+                    using (var check = new Pen(Color.White, 2f))
+                    {
+                        check.StartCap = System.Drawing.Drawing2D.LineCap.Round;
+                        check.EndCap = System.Drawing.Drawing2D.LineCap.Round;
+                        graphics.DrawLines(check, new[] { new Point(4, 7), new Point(6, 10), new Point(11, 4) });
+                    }
+                }
+            }
+            return bitmap;
+        }
+
+        private static Bitmap DrawPowerGlyph(Color color)
+        {
+            var bitmap = new Bitmap(16, 16);
+            using (Graphics graphics = Graphics.FromImage(bitmap))
+            using (var pen = new Pen(color, 1.75f))
+            {
+                graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                pen.StartCap = System.Drawing.Drawing2D.LineCap.Round;
+                pen.EndCap = System.Drawing.Drawing2D.LineCap.Round;
+                graphics.DrawArc(pen, new Rectangle(4, 5, 8, 8), 35, 290);
+                graphics.DrawLine(pen, new Point(8, 3), new Point(8, 8));
+            }
+            return bitmap;
+        }
+
+        private bool HasGlyph(LvTreeItem node) =>
+            glyphImages != null && node.GlyphIndex > 0 && node.GlyphIndex < glyphImages.Images.Count;
 
         private TextFormatFlags GetTextFormatFlags(DataGridViewContentAlignment alignment)
         {
