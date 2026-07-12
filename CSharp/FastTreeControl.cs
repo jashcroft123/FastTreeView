@@ -23,14 +23,24 @@ namespace LvControls
     {
         public string Tag { get; }
         public int ColumnIndex { get; }
-        /// <summary>True when the click was on the expander or optional item glyph.</summary>
-        public bool IsGlyphOrExpander { get; }
+        /// <summary>True when the click was on the optional item glyph in the first column.</summary>
+        public bool IsGlyph { get; }
+        /// <summary>True when the click was on the tree expander in the first column.</summary>
+        public bool IsExpander { get; }
+        /// <summary>True when the click was on either the expander or the optional item glyph.</summary>
+        public bool IsGlyphOrExpander => IsGlyph || IsExpander;
 
-        public LvTreeCellClickedEventArgs(string tag, int columnIndex, bool isGlyphOrExpander)
+        public LvTreeCellClickedEventArgs(string tag, int columnIndex, bool isGlyph, bool isExpander)
         {
             Tag = tag;
             ColumnIndex = columnIndex;
-            IsGlyphOrExpander = isGlyphOrExpander;
+            IsGlyph = isGlyph;
+            IsExpander = isExpander;
+        }
+
+        public LvTreeCellClickedEventArgs(string tag, int columnIndex, bool isGlyphOrExpander)
+            : this(tag, columnIndex, isGlyphOrExpander, isGlyphOrExpander)
+        {
         }
     }
 
@@ -118,7 +128,7 @@ namespace LvControls
         public event EventHandler<string> ActiveItemChanged;
         public event EventHandler<string> ItemDoubleClicked;
         public event EventHandler<string> ItemOpenedClosed;
-        /// <summary>Raised when a data cell is clicked; inspect IsGlyphOrExpander for first-column glyph clicks.</summary>
+        /// <summary>Raised when a data cell is clicked; inspect IsGlyph and IsExpander for first-column click locations.</summary>
         public event EventHandler<LvTreeCellClickedEventArgs> CellClicked;
 
         /// <summary>
@@ -202,7 +212,7 @@ namespace LvControls
             grid.CellValueNeeded += Grid_CellValueNeeded;
             grid.CellPainting += Grid_CellPainting;
             grid.CellMouseDown += Grid_CellMouseDown;
-            grid.CellMouseClick += Grid_CellMouseClick;
+            grid.CellMouseUp += Grid_CellMouseUp;
             grid.CellDoubleClick += Grid_CellDoubleClick;
 
             // Intercept user-initiated clicks before the grid processes them.
@@ -1457,19 +1467,21 @@ namespace LvControls
                 ItemSetOpen(node.Tag, !node.IsOpen);
         }
 
-        private void Grid_CellMouseClick(object sender, DataGridViewCellMouseEventArgs e)
+        private void Grid_CellMouseUp(object sender, DataGridViewCellMouseEventArgs e)
         {
+            if (e.Button != MouseButtons.Left) return;
             if (e.RowIndex < 0 || e.RowIndex >= visibleRows.Count || e.ColumnIndex < 0) return;
             var node = visibleRows[e.RowIndex];
             CellClicked?.Invoke(this, new LvTreeCellClickedEventArgs(
                 node.Tag,
                 e.ColumnIndex,
-                IsGlyphOrExpanderHit(node, e)));
+                IsGlyphHit(node, e),
+                IsExpanderHit(node, e)));
         }
 
-        private bool IsGlyphOrExpanderHit(LvTreeItem node, DataGridViewCellMouseEventArgs e)
+        private bool IsExpanderHit(LvTreeItem node, DataGridViewCellMouseEventArgs e)
         {
-            if (e.ColumnIndex != 0) return false;
+            if (e.ColumnIndex != 0 || !node.HasChildren) return false;
 
             var cellRect = grid.GetCellDisplayRectangle(e.ColumnIndex, e.RowIndex, false);
             Size expanderSize;
@@ -1479,19 +1491,27 @@ namespace LvControls
             }
 
             int left = cellRect.Left + node.Level * IndentPx;
-            if (node.HasChildren)
-            {
-                var expanderRect = new Rectangle(
-                    left,
-                    cellRect.Top + (cellRect.Height - expanderSize.Height) / 2,
-                    expanderSize.Width,
-                    expanderSize.Height);
-                expanderRect.Inflate(3, 3);
-                if (IsMousePointInRectangle(e, cellRect, expanderRect)) return true;
-            }
-            left += expanderSize.Width + 4;
+            var expanderRect = new Rectangle(
+                left,
+                cellRect.Top + (cellRect.Height - expanderSize.Height) / 2,
+                expanderSize.Width,
+                expanderSize.Height);
+            expanderRect.Inflate(3, 3);
+            return IsMousePointInRectangle(e, cellRect, expanderRect);
+        }
 
-            if (!HasGlyph(node)) return false;
+        private bool IsGlyphHit(LvTreeItem node, DataGridViewCellMouseEventArgs e)
+        {
+            if (e.ColumnIndex != 0 || !HasGlyph(node)) return false;
+
+            var cellRect = grid.GetCellDisplayRectangle(e.ColumnIndex, e.RowIndex, false);
+            Size expanderSize;
+            using (var graphics = grid.CreateGraphics())
+            {
+                expanderSize = GetGlyphSize(graphics, node.IsOpen);
+            }
+
+            int left = cellRect.Left + node.Level * IndentPx + expanderSize.Width + 4;
             Size itemGlyphSize = glyphImages.ImageSize;
             var itemGlyphRect = new Rectangle(
                 left,
